@@ -98,6 +98,8 @@ struct _HttpTxPriv {
     /* Regex to parse error message returned by update-branch. */
     GRegex *locked_error_regex;
     GRegex *folder_perm_error_regex;
+    /* Regex to parse error message returned by check_permisson */
+    GRegex *sync_perm_error_regex;
 };
 typedef struct _HttpTxPriv HttpTxPriv;
 
@@ -293,6 +295,7 @@ connection_pool_return_connection (ConnectionPool *pool, Connection *conn)
 
 #define LOCKED_ERROR_PATTERN "File (.+) is locked"
 #define FOLDER_PERM_ERROR_PATTERN "Update to path (.+) is not allowed by folder permission settings"
+#define SYNC_PERM_ERROR_PATTERN "{(.+):(.+),(.+):(.+)}"
 
 HttpTxManager *
 http_tx_manager_new (struct _SeafileSession *seaf)
@@ -327,6 +330,11 @@ http_tx_manager_new (struct _SeafileSession *seaf)
         g_clear_error (&error);
     }
 
+    priv->sync_perm_error_regex = g_regex_new (SYNC_PERM_ERROR_PATTERN, 0, 0, &error);
+    if (error) {
+        seaf_warning ("Failed to create regex '%s': %s\n", SYNC_PERM_ERROR_PATTERN, error->message);
+        g_clear_error (&error);
+    }
     mgr->priv = priv;
 
     return mgr;
@@ -739,11 +747,6 @@ http_get (CURL *curl, const char *url, const char *token,
     struct curl_slist *headers = NULL;
     int ret = 0;
 
-    if (seafile_debug_flag_is_set (SEAFILE_DEBUG_CURL)) {
-        curl_easy_setopt (curl, CURLOPT_VERBOSE, 1);
-        curl_easy_setopt (curl, CURLOPT_STDERR, seafile_get_log_fp());
-    }
-
     headers = curl_slist_append (headers, "User-Agent: Seafile/"SEAFILE_CLIENT_VERSION" ("USER_AGENT_OS")");
 
     if (token) {
@@ -868,11 +871,6 @@ http_put (CURL *curl, const char *url, const char *token,
     struct curl_slist *headers = NULL;
     int ret = 0;
 
-    if (seafile_debug_flag_is_set (SEAFILE_DEBUG_CURL)) {
-        curl_easy_setopt (curl, CURLOPT_VERBOSE, 1);
-        curl_easy_setopt (curl, CURLOPT_STDERR, seafile_get_log_fp());
-    }
-
     headers = curl_slist_append (headers, "User-Agent: Seafile/"SEAFILE_CLIENT_VERSION" ("USER_AGENT_OS")");
     /* Disable the default "Expect: 100-continue" header */
     headers = curl_slist_append (headers, "Expect:");
@@ -989,11 +987,6 @@ http_post (CURL *curl, const char *url, const char *token,
     int ret = 0;
 
     g_return_val_if_fail (req_content != NULL, -1);
-
-    if (seafile_debug_flag_is_set (SEAFILE_DEBUG_CURL)) {
-        curl_easy_setopt (curl, CURLOPT_VERBOSE, 1);
-        curl_easy_setopt (curl, CURLOPT_STDERR, seafile_get_log_fp());
-    }
 
     headers = curl_slist_append (headers, "User-Agent: Seafile/"SEAFILE_CLIENT_VERSION" ("USER_AGENT_OS")");
     /* Disable the default "Expect: 100-continue" header */
@@ -2383,12 +2376,18 @@ clean_tasks_for_repo (HttpTxManager *manager, const char *repo_id)
                                  remove_task_help, (gpointer)repo_id);
 }
 
+static void
+notify_permission_error (HttpTxTask *task, const char *error_str);
+
 static int
 check_permission (HttpTxTask *task, Connection *conn)
 {
     CURL *curl;
     char *url;
     int status;
+    char *rsp_content;
+    gint64 rsp_size;
+    SyncInfo *info;
     int ret = 0;
 
     curl = conn->curl;
@@ -2409,7 +2408,7 @@ check_permission (HttpTxTask *task, Connection *conn)
     }
 
     int curl_error;
-    if (http_get (curl, url, task->token, &status, NULL, NULL, NULL, NULL, TRUE, &curl_error) < 0) {
+    if (http_get (curl, url, task->token, &status, &rsp_content, &rsp_size, NULL, NULL, TRUE, &curl_error) < 0) {
         conn->release = TRUE;
         handle_curl_errors (task, curl_error);
         ret = -1;
@@ -2419,6 +2418,24 @@ check_permission (HttpTxTask *task, Connection *conn)
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
         handle_http_errors (task, status);
+
+        if (status == HTTP_FORBIDDEN) {
+            rsp_content[rsp_size] = '\0';
+            seaf_warning ("%s\n", rsp_content);
+
+            if (rsp_content)
+                notify_permission_error (task, rsp_content);
+
+            info = seaf_sync_manager_get_sync_info (seaf->sync_mgr, task->repo_id);
+
+            if (!info) {
+                info = g_new0 (SyncInfo, 1);
+                memcpy (info->repo_id, task->repo_id, 36);
+                info->sync_perm_err_cnt++;
+                g_hash_table_insert (seaf->sync_mgr->sync_infos, info->repo_id, info);
+            } else
+                info->sync_perm_err_cnt++;
+        }
         ret = -1;
     }
 
@@ -3484,6 +3501,11 @@ notify_permission_error (HttpTxTask *task, const char *error_str)
         send_file_sync_error_notification (task->repo_id, task->repo_name,
                                            (path[0] == '/') ? (path + 1) : path,
                                            SYNC_ERROR_ID_FOLDER_PERM_DENIED);
+        g_free (path);
+    } else if (g_regex_match (priv->sync_perm_error_regex, error_str, 0, &match_info)) {
+        path = g_match_info_fetch (match_info, 4);
+        send_file_sync_error_notification (task->repo_id, task->repo_name,
+                                           path, SYNC_ERROR_ID_PERM_NOT_SYNCABLE);
         g_free (path);
     }
 

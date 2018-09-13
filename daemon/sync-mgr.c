@@ -32,6 +32,8 @@
 #define CHECK_LOCKED_FILES_INTERVAL 10 /* 10s */
 #define CHECK_FOLDER_PERMS_INTERVAL 30 /* 30s */
 
+#define SYNC_PERM_ERROR_RETRY_TIME 2
+
 struct _HttpServerState {
     int http_version;
     gboolean checking;
@@ -358,6 +360,9 @@ seaf_sync_manager_add_sync_task (SeafSyncManager *mgr,
 
     if (info->in_sync)
         return 0;
+
+    if (info->sync_perm_err_cnt != 0)
+        info->sync_perm_err_cnt = 0;
 
     if (repo->version > 0) {
         if (check_http_protocol (mgr, repo)) {
@@ -1988,6 +1993,9 @@ auto_sync_pulse (void *vmanager)
         SyncInfo *info = get_sync_info (manager, repo->id);
 
         if (info->in_sync)
+            continue;
+
+        if (info->sync_perm_err_cnt > SYNC_PERM_ERROR_RETRY_TIME)
             continue;
 
         if (repo->version > 0) {
